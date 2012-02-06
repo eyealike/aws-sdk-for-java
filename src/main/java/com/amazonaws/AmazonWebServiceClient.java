@@ -56,12 +56,17 @@ public abstract class AmazonWebServiceClient {
      *            The client configuration for this client.
      */
     public AmazonWebServiceClient(ClientConfiguration clientConfiguration) {
-        this.clientConfiguration = clientConfiguration;
-        client = new AmazonHttpClient(clientConfiguration);
-        requestHandlers = Collections.synchronizedList(new LinkedList<RequestHandler>());
+        this(clientConfiguration, new AmazonHttpClient(clientConfiguration));
     }
 
-    /**
+    protected AmazonWebServiceClient( ClientConfiguration clientConfiguration, AmazonHttpClient client )
+	{
+		this.clientConfiguration = clientConfiguration;
+		this.client = client;
+        requestHandlers = Collections.synchronizedList(new LinkedList<RequestHandler>());
+	}
+
+	/**
      * Overrides the default endpoint for this client. Callers can use this
      * method to control which AWS region they want to work with.
      * <p>
