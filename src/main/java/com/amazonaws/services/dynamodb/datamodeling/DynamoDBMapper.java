@@ -17,6 +17,7 @@ package com.amazonaws.services.dynamodb.datamodeling;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.text.ParseException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -24,11 +25,10 @@ import java.util.Map;
 import java.util.Map.Entry;
 
 import com.amazonaws.AmazonClientException;
+import com.amazonaws.AmazonWebServiceRequest;
 import com.amazonaws.services.dynamodb.AmazonDynamoDB;
 import com.amazonaws.services.dynamodb.datamodeling.DynamoDBMapperConfig.ConsistentReads;
 import com.amazonaws.services.dynamodb.datamodeling.DynamoDBMapperConfig.SaveBehavior;
-import com.amazonaws.services.dynamodb.datamodeling.internal.PaginatedQueryList;
-import com.amazonaws.services.dynamodb.datamodeling.internal.PaginatedScanList;
 import com.amazonaws.services.dynamodb.model.AttributeValue;
 import com.amazonaws.services.dynamodb.model.AttributeValueUpdate;
 import com.amazonaws.services.dynamodb.model.ConditionalCheckFailedException;
@@ -43,6 +43,7 @@ import com.amazonaws.services.dynamodb.model.QueryResult;
 import com.amazonaws.services.dynamodb.model.ScanRequest;
 import com.amazonaws.services.dynamodb.model.ScanResult;
 import com.amazonaws.services.dynamodb.model.UpdateItemRequest;
+import com.amazonaws.util.VersionInfoUtils;
 
 /**
  * Object mapper for domain-object interaction with DynamoDB.
@@ -103,8 +104,9 @@ import com.amazonaws.services.dynamodb.model.UpdateItemRequest;
  * 
  * <pre>
  * DynamoDBMapper mapper = new DynamoDBMapper(dynamoDBClient);
- * Long key = 105L;
- * TestClass obj = mapper.load(TestClass.class, key);
+ * Long hashKey = 105L;
+ * double rangeKey = 1.0d;
+ * TestClass obj = mapper.load(TestClass.class, hashKey, rangeKey);
  * obj.getIntegerAttribute().add(42);
  * mapper.save(obj);
  * mapper.delete(obj);
@@ -116,6 +118,9 @@ import com.amazonaws.services.dynamodb.model.UpdateItemRequest;
  * exceptions will always be propagated as {@link AmazonClientException}, and
  * DynamoDB-specific subclasses such as {@link ConditionalCheckFailedException}
  * will be used when possible.
+ * <p>
+ * This class is thread-safe and can be shared between threads. It's also very
+ * lightweight, so it doesn't need to be.
  * 
  * @see DynamoDBTable
  * @see DynamoDBHashKey
@@ -133,6 +138,11 @@ public class DynamoDBMapper {
     private final DynamoDBMapperConfig config;
     private static final DynamoDBReflector reflector = new DynamoDBReflector();
 
+    /**
+     * User agent for requests made using the {@link DynamoDBMapper}.
+     */
+    private static final String USER_AGENT = DynamoDBMapper.class.getName() + "/" + VersionInfoUtils.getVersion();
+    
     /**
      * Constructs a new mapper with the service object given, using the default
      * configuration.
@@ -225,9 +235,9 @@ public class DynamoDBMapper {
             rangeKeyElement = getRangeKeyElement(rangeKey, rangeKeyMethod);
         }
 
-        GetItemResult item = db.getItem(new GetItemRequest().withTableName(tableName)
+        GetItemResult item = db.getItem(applyUserAgent(new GetItemRequest().withTableName(tableName)
                 .withKey(new Key().withHashKeyElement(hashKeyElement).withRangeKeyElement(rangeKeyElement))
-                .withConsistentRead(config.getConsistentReads() == ConsistentReads.CONSISTENT));
+                .withConsistentRead(config.getConsistentReads() == ConsistentReads.CONSISTENT)));
         Map<String, AttributeValue> itemAttributes = item.getItem();
         if ( itemAttributes == null ) {
             return null;
@@ -246,29 +256,11 @@ public class DynamoDBMapper {
     }
 
     private AttributeValue getHashKeyElement(Object hashKey, Method hashKeyGetter) {
-        AttributeValue hashKeyElement = new AttributeValue();
-        Class<?> hashKeyMethodReturnType = hashKeyGetter.getReturnType();
-        if ( hashKeyMethodReturnType.isPrimitive() || Number.class.isAssignableFrom(hashKeyMethodReturnType) ) {
-            hashKeyElement.setN(String.valueOf(hashKey));
-        } else if ( String.class.isAssignableFrom(hashKeyMethodReturnType) ) {
-            hashKeyElement.setS(String.valueOf(hashKey));
-        } else {
-            throw new DynamoDBMappingException("Hash key property must be either a Number or a String");
-        }
-        return hashKeyElement;
+        return getSimpleAttributeValue(hashKeyGetter, hashKey);
     }
 
-    private AttributeValue getRangeKeyElement(Object rangeKey, Method rangeKeyMethod) {
-        AttributeValue rangeKeyElement = new AttributeValue();
-        Class<?> rangeKeyMethodReturnType = rangeKeyMethod.getReturnType();
-        if ( rangeKeyMethodReturnType.isPrimitive() || Number.class.isAssignableFrom(rangeKeyMethodReturnType) ) {
-            rangeKeyElement.setN(String.valueOf(rangeKey));
-        } else if ( String.class.isAssignableFrom(rangeKeyMethodReturnType) ) {
-            rangeKeyElement.setS(String.valueOf(rangeKey));
-        } else {
-            throw new DynamoDBMappingException("Range key property must be either a Number or a String");
-        }
-        return rangeKeyElement;
+    private AttributeValue getRangeKeyElement(Object rangeKey, Method rangeKeyGetter) {
+        return getSimpleAttributeValue(rangeKeyGetter, rangeKey);
     }
 
     /**
@@ -306,6 +298,19 @@ public class DynamoDBMapper {
 
         return toReturn;
     }
+    
+    /**
+     * Marshalls the list of item attributes into objects of type clazz
+     * 
+     * @see DynamoDBMapper#marshallIntoObject(Class, Map)
+     */
+    public <T> List<T> marshallIntoObjects(Class<T> clazz, List<Map<String, AttributeValue>> itemAttributes) {
+        List<T> result = new ArrayList<T>();
+        for (Map<String, AttributeValue> item : itemAttributes) {
+            result.add(marshallIntoObject(clazz, item));
+        }
+        return result;
+    }
 
     /**
      * Sets the value in the return object corresponding to the service result.
@@ -330,8 +335,7 @@ public class DynamoDBMapper {
 
     /**
      * Returns an {@link AttributeValue} corresponding to the getter and return
-     * result given, treating it as a non-versioned attribute. Only useful when
-     * differentiating between this method and getAttributeValue.
+     * result given, treating it as a non-versioned attribute.
      */
     private AttributeValue getSimpleAttributeValue(final Method getter, final Object getterReturnResult) {
         if ( getterReturnResult == null )
@@ -388,10 +392,84 @@ public class DynamoDBMapper {
         Map<String, AttributeValueUpdate> updateValues = new HashMap<String, AttributeValueUpdate>();
         Map<String, ExpectedAttributeValue> expectedValues = new HashMap<String, ExpectedAttributeValue>();
 
+        boolean forcePut = config.getSaveBehavior() == SaveBehavior.CLOBBER;
+        boolean nonKeyAttributePresent = false;
+        List<ValueUpdate> inMemoryUpdates = new LinkedList<ValueUpdate>();
+
+        /*
+         * First look at the keys and construct updates for them independently
+         */
+        List<Method> keyGetterMethods = new LinkedList<Method>();
+        keyGetterMethods.add(hashKeyGetter);
+        if ( rangeKeyGetter != null ) {
+            keyGetterMethods.add(rangeKeyGetter);
+        }
+
+        /*
+         * Determine if there are any auto-assigned keys to assign. If so, force
+         * a put and assign the keys
+         */
+        if ( !forcePut ) {
+            for ( Method method : keyGetterMethods ) {
+                Object getterResult = safeInvoke(method, object);
+                if ( getterResult == null && reflector.isAssignableKey(method) ) {
+                    forcePut = true;
+                }
+            }
+        }
+
+        /*
+         * If we're doing a put, that means that we need update values for the
+         * key attributes.
+         */
+        if ( forcePut ) {
+            for ( Method method : keyGetterMethods ) {
+                Object getterResult = safeInvoke(method, object);
+                String attributeName = reflector.getAttributeName(method);
+
+                if ( getterResult == null && reflector.isAssignableKey(method) ) {
+                    AttributeValue newVersionValue = getAutoGeneratedKeyAttributeValue(method, getterResult);
+                    updateValues.put(attributeName,
+                            new AttributeValueUpdate().withAction("PUT").withValue(newVersionValue));
+                    inMemoryUpdates.add(new ValueUpdate(method, newVersionValue));
+
+                    if ( config.getSaveBehavior() != SaveBehavior.CLOBBER ) {
+                        // Add an expect clause to make sure that the item
+                        // doesn't already exist, since it's supposed to be new
+                        ExpectedAttributeValue expected = new ExpectedAttributeValue();
+                        expected.setExists(false);
+                        expectedValues.put(attributeName, expected);
+                    }
+                } else {
+                    AttributeValue currentValue = getSimpleAttributeValue(method, getterResult);
+                    if ( currentValue != null ) {
+                        updateValues.put(attributeName,
+                                new AttributeValueUpdate().withValue(currentValue).withAction("PUT"));
+                    } else {
+                        throw new DynamoDBMappingException("Null value for non-generated key for method " + method);
+                    }
+                }
+            }
+        } else {
+            /*
+             * If we don't have the required keys by this point, it's an error
+             */
+            if ( hashKeyElement == null ) {
+                throw new DynamoDBMappingException("No value provided for hash key for object " + object);
+            }
+            if ( rangeKeyGetter != null && rangeKeyElement == null ) {
+                throw new DynamoDBMappingException("No value provided for range key for object " + object);
+            }
+        }
+
         // Look at every getter and construct an update object for it
-        boolean forcePut = false;
-        List<ValueUpdate> inMemoryUpdates = new LinkedList<DynamoDBMapper.ValueUpdate>();
         for ( Method method : reflector.getRelevantGetters(clazz) ) {
+
+            // Skip any key methods, since they are handled separately
+            if ( method.equals(hashKeyGetter) || method.equals(rangeKeyGetter) )
+                continue;
+            
+            nonKeyAttributePresent = true;
 
             Object getterResult = safeInvoke(method, object);
             String attributeName = reflector.getAttributeName(method);
@@ -422,23 +500,9 @@ public class DynamoDBMapper {
             }
 
             /*
-             * If this is a new item being saved, assign a key if possible and
-             * force a put, rather than an update
+             * Otherwise apply the update value for this attribute.
              */
-            else if ( getterResult == null && reflector.isAssignableKey(method) ) {
-                forcePut = true;
-                AttributeValue newVersionValue = getAutoGeneratedKeyAttributeValue(method, getterResult);
-                updateValues
-                        .put(attributeName, new AttributeValueUpdate().withAction("PUT").withValue(newVersionValue));
-                inMemoryUpdates.add(new ValueUpdate(method, newVersionValue));
-            }
-
-            /*
-             * Otherwise apply the put value for this attribute. Hash and range
-             * keys are included in puts, but not updates.
-             */
-            else if ( config.getSaveBehavior() == SaveBehavior.CLOBBER
-                    || (!method.equals(hashKeyGetter) && !method.equals(rangeKeyGetter)) ) {
+            else  {
                 AttributeValue currentValue = getSimpleAttributeValue(method, getterResult);
                 if ( currentValue != null ) {
                     updateValues.put(attributeName, new AttributeValueUpdate().withValue(currentValue)
@@ -454,11 +518,13 @@ public class DynamoDBMapper {
          * the default), we need to munge the data type.
          */
         if ( config.getSaveBehavior() == SaveBehavior.CLOBBER || forcePut ) {
-            db.putItem(new PutItemRequest().withTableName(tableName).withItem(convertToItem(updateValues))
-                    .withExpected(expectedValues));
+            db.putItem(applyUserAgent(new PutItemRequest().withTableName(tableName).withItem(convertToItem(updateValues))
+                    .withExpected(expectedValues)));
+        } else if ( !nonKeyAttributePresent ) {
+            keyOnlyPut(tableName, objectKey, hashKeyGetter, rangeKeyGetter);
         } else {
-            db.updateItem(new UpdateItemRequest().withTableName(tableName).withKey(objectKey)
-                    .withAttributeUpdates(updateValues).withExpected(expectedValues));
+            db.updateItem(applyUserAgent(new UpdateItemRequest().withTableName(tableName).withKey(objectKey)
+                    .withAttributeUpdates(updateValues).withExpected(expectedValues)));
         }
 
         /*
@@ -470,6 +536,34 @@ public class DynamoDBMapper {
         }
     }
     
+    /**
+     * Edge case to deal with the problem reported here:
+     * https://forums.aws.amazon.com/thread.jspa?threadID=86798&tstart=25
+     * <p>
+     * DynamoDB cannot process an updateItem request that only contains the key
+     * attribute(s), so we have to do a putItem. Somewhat confusingly, we also
+     * insist that an item with the key(s) given doesn't already exist. This
+     * isn't perfect, but we should be doing a putItem at all in this case, so
+     * it's the best we can do.
+     */
+    private void keyOnlyPut(String tableName, Key objectKey, Method hashKeyGetter, Method rangeKeyGetter) {
+        Map<String, AttributeValue> attributes = new HashMap<String, AttributeValue>();
+        Map<String, ExpectedAttributeValue> expectedValues = new HashMap<String, ExpectedAttributeValue>();
+
+        String hashKeyAttributeName = reflector.getAttributeName(hashKeyGetter);
+        attributes.put(hashKeyAttributeName, objectKey.getHashKeyElement());
+        expectedValues.put(hashKeyAttributeName, new ExpectedAttributeValue().withExists(false));
+        
+        if (rangeKeyGetter != null) {
+            String rangeKeyAttributeName = reflector.getAttributeName(rangeKeyGetter);
+            attributes.put(rangeKeyAttributeName, objectKey.getRangeKeyElement());
+            expectedValues.put(rangeKeyAttributeName, new ExpectedAttributeValue().withExists(false));
+        }
+        
+        db.putItem(applyUserAgent(new PutItemRequest().withTableName(tableName).withItem(attributes)
+                .withExpected(expectedValues)));
+    }
+
     /**
      * Deletes the given object from its DynamoDB table.
      */
@@ -528,7 +622,7 @@ public class DynamoDBMapper {
             }
         }
         
-        db.deleteItem(new DeleteItemRequest().withKey(objectKey).withTableName(tableName).withExpected(expectedValues));
+        db.deleteItem(applyUserAgent(new DeleteItemRequest().withKey(objectKey).withTableName(tableName).withExpected(expectedValues)));
     }
     
     /**
@@ -606,36 +700,28 @@ public class DynamoDBMapper {
      * Callers should be aware that the returned list is unmodifiable, and any
      * attempts to modify the list will result in an
      * UnsupportedOperationException.
-     *
+     * <p>
+     * The unmodifiable list returned is lazily loaded when possible, so calls
+     * to DynamoDB will be made only as needed.
+     * 
      * @param <T>
      *            The type of the objects being returned.
-     *
      * @param clazz
      *            The class annotated with DynamoDB annotations describing how
      *            to store the object data in AWS DynamoDB.
      * @param scanExpression
      *            Details on how to run the scan, including any filters to apply
      *            to limit results.
-     *
      * @return An unmodifiable list of the objects constructed from the results
      *         of the scan operation.
-     *
-     * @throws Exception
-     *             If there were any problems loading the data from AWS
-     *             DynamoDB.
+     *         
+     * @see PaginatedScanList
      */
-    public <T> List<T> scan(Class<T> clazz, DynamoDBScanExpression scanExpression) throws Exception {
+    public <T> PaginatedScanList<T> scan(Class<T> clazz, DynamoDBScanExpression scanExpression) {
         ScanRequest scanRequest = createScanRequestFromExpression(clazz, scanExpression);
 
-        ScanResult scanResult = db.scan(scanRequest);
-        int count = scanResult.getCount();
-
-        // If the results are truncated, figure out the count
-        if (scanResult.getLastEvaluatedKey() != null) {
-            count = count(clazz, scanExpression);
-        }
-
-        return new PaginatedScanList<T>(this, clazz, db, count, scanRequest, scanResult);
+        ScanResult scanResult = db.scan(applyUserAgent(scanRequest));
+        return new PaginatedScanList<T>(this, clazz, db, scanRequest, scanResult);
     }
 
     /**
@@ -649,40 +735,62 @@ public class DynamoDBMapper {
      * Callers should be aware that the returned list is unmodifiable, and any
      * attempts to modify the list will result in an
      * UnsupportedOperationException.
+     * <p>
+     * The unmodifiable list returned is lazily loaded when possible, so calls
+     * to DynamoDB will be made only as needed.
      *
      * @param <T>
      *            The type of the objects being returned.
-     *
      * @param clazz
      *            The class annotated with DynamoDB annotations describing how
      *            to store the object data in AWS DynamoDB.
      * @param queryExpression
      *            Details on how to run the query, including any filters to
      *            apply to limit the results.
-     *
      * @return An unmodifiable list of the objects constructed from the results
      *         of the query operation.
-     *
-     * @throws Exception
-     *             If there were any problems loading the data from AWS
-     *             DynamoDB.
+     *         
+     * @see PaginatedQueryList        
      */
-    public <T> List<T> query(Class<T> clazz, DynamoDBQueryExpression queryExpression) throws Exception {
+    public <T> PaginatedQueryList<T> query(Class<T> clazz, DynamoDBQueryExpression queryExpression) {
         QueryRequest queryRequest = createQueryRequestFromExpression(clazz, queryExpression);
 
-        QueryResult queryResult = db.query(queryRequest);
-        int count = queryResult.getCount();
-
-        // If the results are truncated, figure out the count
-        if (queryResult.getLastEvaluatedKey() != null) {
-            count = count(clazz, queryExpression);
-        }
-
-        return new PaginatedQueryList<T>(this, clazz, db, count, queryRequest, queryResult);
+        QueryResult queryResult = db.query(applyUserAgent(queryRequest));
+        return new PaginatedQueryList<T>(this, clazz, db, queryRequest, queryResult);
     }
 
     /**
      * Evaluates the specified scan expression and returns the count of matching
+     * items, without returning any of the actual item data.
+     * <p>
+     * This operation will scan your entire table, and can therefore be very
+     * expensive. Use with caution.
+     * 
+     * @param clazz
+     *            The class mapped to a DynamoDB table.
+     * @param scanExpression
+     *            The parameters for running the scan.
+     * @return The count of matching items, without returning any of the actual
+     *         item data.
+     */
+    public int count(Class<?> clazz, DynamoDBScanExpression scanExpression) {
+        ScanRequest scanRequest = createScanRequestFromExpression(clazz, scanExpression);
+        scanRequest.setCount(true);
+
+        // Count scans can also be truncated for large datasets
+        int count = 0;
+        ScanResult scanResult = null;
+        do {
+            scanResult = db.scan(applyUserAgent(scanRequest));
+            count += scanResult.getCount();
+            scanRequest.setExclusiveStartKey(scanResult.getLastEvaluatedKey());
+        } while (scanResult.getLastEvaluatedKey() != null);
+
+        return count;
+    }
+
+    /**
+     * Evaluates the specified query expression and returns the count of matching
      * items, without returning any of the actual item data.
      *
      * @param clazz
@@ -692,28 +800,8 @@ public class DynamoDBMapper {
      *
      * @return The count of matching items, without returning any of the actual
      *         item data.
-     *
-     * @throws Exception
-     *             If any problems were encountered making the request to AWS
-     *             DynamoDB.
      */
-    public int count(Class<?> clazz, DynamoDBScanExpression scanExpression) throws Exception {
-        ScanRequest scanRequest = createScanRequestFromExpression(clazz, scanExpression);
-        scanRequest.setCount(true);
-
-        // Count scans can also be truncated for large datasets
-        int count = 0;
-        ScanResult scanResult = null;
-        do {
-            scanResult = db.scan(scanRequest);
-            count += scanResult.getCount();
-            scanRequest.setExclusiveStartKey(scanResult.getLastEvaluatedKey());
-        } while (scanResult.getLastEvaluatedKey() != null);
-
-        return count;
-    }
-
-    public int count(Class<?> clazz, DynamoDBQueryExpression queryExpression) throws Exception {
+    public int count(Class<?> clazz, DynamoDBQueryExpression queryExpression) {
         QueryRequest queryRequest = createQueryRequestFromExpression(clazz, queryExpression);
         queryRequest.setCount(true);
 
@@ -721,7 +809,7 @@ public class DynamoDBMapper {
         int count = 0;
         QueryResult queryResult = null;
         do {
-            queryResult = db.query(queryRequest);
+            queryResult = db.query(applyUserAgent(queryRequest));
             count += queryResult.getCount();
             queryRequest.setExclusiveStartKey(queryResult.getLastEvaluatedKey());
         } while (queryResult.getLastEvaluatedKey() != null);
@@ -730,25 +818,26 @@ public class DynamoDBMapper {
     }
 
     private ScanRequest createScanRequestFromExpression(Class<?> clazz, DynamoDBScanExpression scanExpression) {
-        DynamoDBTable table = reflector.getTable(clazz);
-
         ScanRequest scanRequest = new ScanRequest();
-        scanRequest.setTableName(table.tableName());
+        scanRequest.setTableName(getTableName(clazz, config));
         scanRequest.setScanFilter(scanExpression.getScanFilter());
 
         return scanRequest;
     }
 
     private QueryRequest createQueryRequestFromExpression(Class<?> clazz, DynamoDBQueryExpression queryExpression) {
-        DynamoDBTable table = reflector.getTable(clazz);
-
         QueryRequest queryRequest = new QueryRequest();
         queryRequest.setConsistentRead(queryExpression.isConsistentRead());
-        queryRequest.setTableName(table.tableName());
+        queryRequest.setTableName(getTableName(clazz, config));
         queryRequest.setHashKeyValue(queryExpression.getHashKeyValue());
         queryRequest.setScanIndexForward(queryExpression.isScanIndexForward());
         queryRequest.setRangeKeyCondition(queryExpression.getRangeKeyCondition());
 
         return queryRequest;
+    }
+    
+    static <X extends AmazonWebServiceRequest> X applyUserAgent(X request) {
+        request.getRequestClientOptions().addClientMarker(USER_AGENT);
+        return request;
     }
 }
